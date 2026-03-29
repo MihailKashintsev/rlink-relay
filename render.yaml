@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: rlink-relay
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8080
+    healthCheckPath: /health
