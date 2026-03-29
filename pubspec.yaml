@@ -1,0 +1,12 @@
+name: rlink_relay
+description: Zero-knowledge WebSocket relay for Rlink mesh messenger
+version: 1.0.0
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  shelf: ^1.4.1
+  shelf_web_socket: ^2.0.0
+  web_socket_channel: ^3.0.0
+  crypto: ^3.0.3
