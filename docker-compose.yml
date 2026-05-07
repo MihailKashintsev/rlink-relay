@@ -1,0 +1,34 @@
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rlink-relay
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      VAPID_PUBLIC_KEY: "${VAPID_PUBLIC_KEY:-}"
+      VAPID_PRIVATE_KEY_PEM: "${VAPID_PRIVATE_KEY_PEM:-}"
+      VAPID_SUBJECT: "${VAPID_SUBJECT:-mailto:admin@rlink.local}"
+      RELAY_ADMIN_HASH: "${RELAY_ADMIN_HASH:-}"
+      TURN_HOST: "${TURN_HOST:-}"
+      TURN_USER: "${TURN_USER:-}"
+      TURN_PASSWORD: "${TURN_PASSWORD:-}"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    working_dir: /app/data
+
+  turn:
+    image: coturn/coturn:4.6.3-r2
+    container_name: rlink-turn
+    restart: unless-stopped
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "5349:5349/tcp"
+      - "49160-49200:49160-49200/udp"
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
