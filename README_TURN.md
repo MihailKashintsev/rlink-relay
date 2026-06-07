@@ -19,9 +19,8 @@ cp .env.example .env
 # Edit .env and set RELAY_ADMIN_HASH to the hash above
 ```
 
-The **default** app admin password is `Misha0000ff2010` — its hash is already in `.env.example`.
-Use the same password when prompted by the app.  
-**Change this in production.**
+Do not use the development/default admin password in production. Keep
+`RELAY_ADMIN_HASH` unique per deployment.
 
 ## 1) Configure TURN credentials
 
