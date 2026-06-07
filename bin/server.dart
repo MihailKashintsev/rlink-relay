@@ -232,7 +232,8 @@ const _botOwnerListRateWindow = Duration(minutes: 1);
 const _botOwnerListRateMax = 45;
 const _botOwnerPatchRateWindow = Duration(minutes: 1);
 const _botOwnerPatchRateMax = 45;
-final String _relayAdminHash =
+const _relayAdminFile = 'relay_admin.json';
+String _relayAdminHash =
     (Platform.environment['RELAY_ADMIN_HASH'] ?? '').trim().toLowerCase();
 final bool _verbosePacketLogs =
     (Platform.environment['RELAY_VERBOSE_PACKET_LOGS'] ?? '').trim() == '1';
@@ -266,6 +267,35 @@ final Set<String> _reservedBotHandles = {
 String _sha256HexUtf8(String s) {
   final d = sha256.convert(utf8.encode(s));
   return d.bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+}
+
+bool _isSha256Hex(String value) => RegExp(r'^[0-9a-f]{64}$').hasMatch(value);
+
+void _loadRelayAdminConfig() {
+  try {
+    final f = File(_relayAdminFile);
+    if (!f.existsSync()) return;
+    final decoded = jsonDecode(f.readAsStringSync());
+    if (decoded is! Map) return;
+    final hash = _jsonString(decoded['adminHash']).toLowerCase().trim();
+    if (_isSha256Hex(hash)) {
+      _relayAdminHash = hash;
+      stdout.writeln('[RLINK][Relay] Loaded persisted admin hash');
+    }
+  } catch (e) {
+    stdout.writeln('[RLINK][Relay] relay_admin load: $e');
+  }
+}
+
+void _persistRelayAdminConfig() {
+  try {
+    File(_relayAdminFile).writeAsStringSync(jsonEncode({
+      'adminHash': _relayAdminHash,
+      'updatedAt': DateTime.now().millisecondsSinceEpoch,
+    }));
+  } catch (e) {
+    stdout.writeln('[RLINK][Relay] relay_admin save: $e');
+  }
 }
 
 String _randomUrlToken() {
@@ -1861,7 +1891,8 @@ void _handleMessage(_User user, dynamic raw) {
       type != 'bot_owner_list' &&
       type != 'bot_owner_patch' &&
       type != 'bot_info_get' &&
-      type != 'bot_commands_set') {
+      type != 'bot_commands_set' &&
+      type != 'admin_password_update') {
     if (!_checkRate(user.publicKey)) {
       user.ws.sink.add(jsonEncode({'type': 'error', 'msg': 'rate_limited'}));
       return;
@@ -1914,10 +1945,45 @@ void _handleMessage(_User user, dynamic raw) {
     case 'admin_bot_update':
       _handleAdminBotUpdate(user, msg);
       break;
+    case 'admin_password_update':
+      _handleAdminPasswordUpdate(user, msg);
+      break;
     case 'relay_ack':
       _handleRelayAck(user, msg);
       break;
   }
+}
+
+void _handleAdminPasswordUpdate(_User user, Map<String, dynamic> msg) {
+  final reqId = _jsonString(msg['reqId']).trim();
+  void ack(Map<String, dynamic> body) {
+    try {
+      user.ws.sink.add(jsonEncode({
+        'type': 'admin_password_update_ack',
+        'reqId': reqId,
+        ...body,
+      }));
+    } catch (_) {}
+  }
+
+  final oldHash = _jsonString(msg['oldHash']).toLowerCase().trim();
+  final newHash = _jsonString(msg['newHash']).toLowerCase().trim();
+  if (!_isSha256Hex(oldHash) || !_isSha256Hex(newHash)) {
+    ack({'ok': false, 'error': 'bad_hash'});
+    return;
+  }
+  if (_relayAdminHash.isEmpty) {
+    ack({'ok': false, 'error': 'admin_not_configured'});
+    return;
+  }
+  if (!_isAdminHashValid(oldHash)) {
+    ack({'ok': false, 'error': 'forbidden'});
+    return;
+  }
+  _relayAdminHash = newHash;
+  _persistRelayAdminConfig();
+  stdout.writeln('[RLINK][Relay] admin hash updated by ${user.shortId}');
+  ack({'ok': true});
 }
 
 void _handleRelayAck(_User user, Map<String, dynamic> msg) {
@@ -2700,6 +2766,7 @@ Future<shelf.Response> _infoHandler(shelf.Request request) async {
 
 Future<void> main() async {
   final port = int.tryParse(Platform.environment['PORT'] ?? '') ?? 8080;
+  _loadRelayAdminConfig();
   _loadAccountBlobs();
   _loadMailbox();
   _loadPushSubscriptions();
