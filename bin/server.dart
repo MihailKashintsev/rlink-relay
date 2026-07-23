@@ -12,6 +12,8 @@ import 'package:shelf/shelf_io.dart' as io;
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'oauth.dart';
+
 /// ═══════════════════════════════════════════════════════════════════
 /// Rlink Relay Server — Zero-Knowledge WebSocket Relay
 /// ═══════════════════════════════════════════════════════════════════
@@ -2693,6 +2695,9 @@ Future<shelf.Response> _infoHandler(shelf.Request request) async {
       },
     );
   }
+  // Durable Google Drive linking: /oauth/google/{start,callback,token}.
+  final oauthResp = await handleGoogleOauth(request);
+  if (oauthResp != null) return oauthResp;
   if (request.url.path == 'push/public_key') {
     if (!_webPushConfigured) {
       return _jsonResponse({'enabled': false, 'publicKey': ''}, status: 503);
