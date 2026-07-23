@@ -2158,6 +2158,7 @@ void _handlePacket(_User sender, Map<String, dynamic> msg) {
   final toRaw = msg['to'] as String?;
   final data = msg['data'] as String?; // base64-encoded encrypted packet
   if (toRaw == null || data == null) return;
+  final noPush = msg['noPush'] as bool? ?? false;
   if (data.length > 262144) {
     _droppedOversizePackets++;
     return; // 256 KB max (blob chunks double-base64 ~90 KB each)
@@ -2182,12 +2183,14 @@ void _handlePacket(_User sender, Map<String, dynamic> msg) {
 
   final recipient = _users[to];
   if (recipient == null) {
-    final kind = _queuedKindFromPacketData(data);
-    unawaited(_notifyRecipientQueued(
-      recipientKey: to,
-      senderKey: sender.publicKey,
-      kind: kind,
-    ));
+    if (!noPush) {
+      final kind = _queuedKindFromPacketData(data);
+      unawaited(_notifyRecipientQueued(
+        recipientKey: to,
+        senderKey: sender.publicKey,
+        kind: kind,
+      ));
+    }
     sender.ws.sink.add(jsonEncode({
       'type': 'delivery_status',
       'to': to,
@@ -2249,6 +2252,7 @@ void _handleBroadcast(_User sender, Map<String, dynamic> msg) {
 void _handleBlob(_User sender, Map<String, dynamic> msg) {
   final toRaw = msg['to'] as String?;
   if (toRaw == null) return;
+  final noPush = msg['noPush'] as bool? ?? false;
   final to = toRaw.toLowerCase();
   final fullTo = (msg['fullTo'] as String?)?.toLowerCase();
   // Use fullTo (full public key) for routing when available;
@@ -2287,10 +2291,12 @@ void _handleBlob(_User sender, Map<String, dynamic> msg) {
 
   final recipient = _users[routeKey];
   if (recipient == null) {
-    unawaited(_notifyRecipientQueued(
-      recipientKey: routeKey,
-      senderKey: sender.publicKey,
-    ));
+    if (!noPush) {
+      unawaited(_notifyRecipientQueued(
+        recipientKey: routeKey,
+        senderKey: sender.publicKey,
+      ));
+    }
     sender.ws.sink.add(jsonEncode({
       'type': 'delivery_status',
       'to': routeKey,
