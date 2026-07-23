@@ -1360,6 +1360,7 @@ Future<void> _handleBotOwnerPatchAsync(
       obj.containsKey('avatarUrl') ||
       obj.containsKey('bannerUrl') ||
       obj['revoke'] == true ||
+      obj['verifyRequest'] == true ||
       obj['clearAvatar'] == true ||
       obj['clearBanner'] == true;
   if (!hasChange) {
@@ -1453,6 +1454,19 @@ Future<void> _handleBotOwnerPatchAsync(
     changed = true;
   }
 
+  // Заявка владельца на верификацию («галочку»). Фиксируем как флаг + запись
+  // активности — админ видит её в панели и решает выдать галочку.
+  if (obj['verifyRequest'] == true) {
+    final note = _jsonString(obj['verifyNote']).trim();
+    final trimmedNote = note.length > 200 ? note.substring(0, 200) : note;
+    row['verifyRequested'] = true;
+    row['verifyRequestedAt'] = nowMs;
+    if (trimmedNote.isNotEmpty) row['verifyNote'] = trimmedNote;
+    _recordBotActivity(botId, 'verify_request',
+        peerId: owner, detail: trimmedNote, persist: false);
+    changed = true;
+  }
+
   if (changed) {
     row['updatedAt'] = nowMs;
     _recordBotActivity(botId, 'owner_patch', peerId: owner, persist: false);
@@ -1488,6 +1502,56 @@ void _sendChannelDirSnapshot(WebSocketChannel ws) {
 
 void _handleChannelDirPut(_User user, Map<String, dynamic> msg) {
   unawaited(_handleChannelDirPutAsync(user, msg));
+}
+
+void _broadcastChannelDirSnapshotToAll() {
+  for (final u in _users.values) {
+    _sendChannelDirSnapshot(u.ws);
+  }
+}
+
+/// Relay-admin grants/clears a channel checkmark. Stored on the directory
+/// record (created minimally if the channel hasn't published yet) so it is
+/// server-authoritative and survives any re-login or admin re-publish.
+void _handleAdminChannelVerify(_User user, Map<String, dynamic> msg) {
+  final reqId = _jsonString(msg['reqId']);
+  void ack(Map<String, dynamic> extra) {
+    try {
+      user.ws.sink.add(jsonEncode({
+        'type': 'admin_channel_verify_ack',
+        if (reqId.isNotEmpty) 'reqId': reqId,
+        ...extra,
+      }));
+    } catch (_) {}
+  }
+
+  if (!_isAdminHashValid(_jsonString(msg['adminHash']))) {
+    ack({'ok': false, 'error': 'forbidden'});
+    return;
+  }
+  final channelId = _jsonString(msg['channelId']);
+  if (channelId.isEmpty) {
+    ack({'ok': false, 'error': 'bad_channel_id'});
+    return;
+  }
+  final verified = msg['verified'] == true;
+  final verifiedBy = _jsonString(msg['verifiedBy']);
+
+  final row = _channelDirectory[channelId] ??=
+      <String, dynamic>{'channelId': channelId, 'isPublic': true};
+  row['verified'] = verified;
+  if (verified) {
+    row['verifiedBy'] = verifiedBy.isEmpty ? 'admin' : verifiedBy;
+  } else {
+    row.remove('verifiedBy');
+  }
+  // Bump so clients (which rev-gate on updatedAt) re-apply the change.
+  row['updatedAt'] = DateTime.now().millisecondsSinceEpoch;
+  _persistChannelDirectory();
+  _broadcastChannelDirSnapshotToAll();
+  stdout.writeln(
+      '[RLINK][Relay] admin_channel_verify $channelId verified=$verified');
+  ack({'ok': true, 'channelId': channelId, 'verified': verified});
 }
 
 Future<void> _handleChannelDirPutAsync(
@@ -1605,6 +1669,17 @@ Future<void> _handleChannelDirPutAsync(
       } catch (_) {}
       return;
     }
+  }
+
+  // Verification is relay-authoritative: only admin_channel_verify grants or
+  // clears it. A normal directory put by the channel admin can neither
+  // self-verify nor wipe a platform-granted checkmark — carry it over.
+  if (existing != null && existing['verified'] == true) {
+    obj['verified'] = true;
+    obj['verifiedBy'] = existing['verifiedBy'];
+  } else {
+    obj['verified'] = false;
+    obj.remove('verifiedBy');
   }
 
   _channelDirectory[channelId] = obj;
@@ -1946,6 +2021,9 @@ void _handleMessage(_User user, dynamic raw) {
     case 'admin_bot_update':
       _handleAdminBotUpdate(user, msg);
       break;
+    case 'admin_channel_verify':
+      _handleAdminChannelVerify(user, msg);
+      break;
     case 'admin_password_update':
       _handleAdminPasswordUpdate(user, msg);
       break;
@@ -2074,6 +2152,9 @@ void _handleAdminBotList(_User user, Map<String, dynamic> msg) {
       'blocked': blocked,
       'verified': verified,
       'revoked': revoked,
+      'verifyRequested': m['verifyRequested'] == true,
+      'verifyRequestedAt': m['verifyRequestedAt'] ?? 0,
+      'verifyNote': _jsonString(m['verifyNote']),
       'activity': activity,
     });
   }
@@ -2112,6 +2193,8 @@ void _handleAdminBotUpdate(_User user, Map<String, dynamic> msg) {
   var changed = false;
   if (msg.containsKey('verified')) {
     row['verified'] = msg['verified'] == true;
+    // Выдача/снятие галочки закрывает заявку владельца.
+    if (row.containsKey('verifyRequested')) row['verifyRequested'] = false;
     changed = true;
   }
   if (msg.containsKey('blocked')) {
@@ -2196,6 +2279,16 @@ void _handlePacket(_User sender, Map<String, dynamic> msg) {
       'to': to,
       'status': 'queued_offline',
     }));
+    if (recipientIsBot) {
+      // Гибридная модель: бот работает на ПК/сервере владельца. Сообщение
+      // поставлено в очередь и будет доставлено, когда процесс подключится, а
+      // отправителю показываем локальную заглушку «Бот не в сети…».
+      sender.ws.sink.add(jsonEncode({
+        'type': 'bot_offline',
+        'bot': to,
+        'relayMsgId': relayMsgId,
+      }));
+    }
     return;
   }
   try {
@@ -2270,8 +2363,10 @@ void _handleBlob(_User sender, Map<String, dynamic> msg) {
   if (relayMsgId == null || relayMsgId.isEmpty) return;
   final data = msg['data'] as String?;
   if (data == null || data.isEmpty) return;
-  if (data.length > 10485760) {
-    // 10 MB max for blobs (base64)
+  if (data.length > 209715200) {
+    // 200 MB max for a single blob message (base64). Raised from 10 MB.
+    // Large files are already chunked client-side (48 KB pieces), so this
+    // per-message cap is rarely the binding constraint.
     return;
   }
   final senderIsBot = _isKnownBot(sender.publicKey);
@@ -2644,6 +2739,113 @@ Future<shelf.Response> _infoHandler(shelf.Request request) async {
     } catch (_) {
       return _jsonResponse({'ok': false, 'error': 'invalid_payload'},
           status: 400);
+    }
+  }
+  if (request.url.path == 'push/test' && request.method == 'POST') {
+    if (!_webPushConfigured) {
+      return _jsonResponse({'ok': false, 'error': 'push_not_configured'},
+          status: 503);
+    }
+    try {
+      final raw = await request.readAsString();
+      final decoded = jsonDecode(raw);
+      final publicKey = (decoded is Map
+              ? (decoded['publicKey'] as String?)
+              : null)
+          ?.trim()
+          .toLowerCase() ??
+          '';
+      if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(publicKey)) {
+        return _jsonResponse({'ok': false, 'error': 'bad_request'},
+            status: 400);
+      }
+      final subs = _pushSubscriptions[publicKey];
+      if (subs == null || subs.isEmpty) {
+        return _jsonResponse(
+            {'ok': false, 'error': 'no_subscription', 'sent': 0});
+      }
+      var sent = 0;
+      final toRemove = <String>{};
+      final client = HttpClient();
+      try {
+        for (final sub in subs) {
+          final endpoint = (sub['endpoint'] as String?)?.trim() ?? '';
+          if (endpoint.isEmpty) continue;
+          try {
+            // Payloadless push (Web Push rejects unencrypted payloads → 400).
+            final req = await client.postUrl(Uri.parse(endpoint));
+            req.headers.set('TTL', '60');
+            req.headers.set('Authorization', _vapidAuthHeader(endpoint));
+            req.headers.set('Urgency', 'high');
+            final resp = await req.close();
+            if (resp.statusCode == 404 || resp.statusCode == 410) {
+              toRemove.add(endpoint);
+            } else if (resp.statusCode >= 200 && resp.statusCode < 300) {
+              sent++;
+            }
+          } catch (_) {}
+        }
+      } finally {
+        client.close(force: true);
+      }
+      if (toRemove.isNotEmpty) {
+        subs.removeWhere(
+            (s) => toRemove.contains((s['endpoint'] as String?) ?? ''));
+        if (subs.isEmpty) _pushSubscriptions.remove(publicKey);
+        _persistPushSubscriptions();
+      }
+      return _jsonResponse({'ok': sent > 0, 'sent': sent});
+    } catch (_) {
+      return _jsonResponse({'ok': false, 'error': 'invalid_payload'},
+          status: 400);
+    }
+  }
+  if (request.url.path == 'translate') {
+    // Прокси Google Translate (gtx). Нужен, потому что браузер блокирует прямой
+    // запрос клиента к googleapis (CORS). Сервер ходит сам и отдаёт результат.
+    final tl = (request.url.queryParameters['tl'] ?? 'en').trim();
+    final q = request.url.queryParameters['q'] ?? '';
+    if (q.isEmpty || q.length > 5000) {
+      return _jsonResponse({'ok': false, 'error': 'bad_request'}, status: 400);
+    }
+    try {
+      final uri = Uri.https('translate.googleapis.com', '/translate_a/single', {
+        'client': 'gtx',
+        'sl': 'auto',
+        'tl': tl.isEmpty ? 'en' : tl,
+        'dt': 't',
+        'q': q,
+      });
+      final client = HttpClient();
+      try {
+        final req = await client.getUrl(uri);
+        req.headers.set('User-Agent', 'Mozilla/5.0 (compatible; RlinkRelay)');
+        final resp = await req.close();
+        if (resp.statusCode != 200) {
+          return _jsonResponse(
+              {'ok': false, 'error': 'upstream_${resp.statusCode}'},
+              status: 502);
+        }
+        final body = await resp.transform(utf8.decoder).join();
+        final data = jsonDecode(body);
+        final sb = StringBuffer();
+        if (data is List && data.isNotEmpty && data[0] is List) {
+          for (final seg in (data[0] as List)) {
+            if (seg is List && seg.isNotEmpty && seg[0] is String) {
+              sb.write(seg[0] as String);
+            }
+          }
+        }
+        final out = sb.toString();
+        if (out.isEmpty) {
+          return _jsonResponse({'ok': false, 'error': 'empty'});
+        }
+        return _jsonResponse({'ok': true, 'text': out});
+      } finally {
+        client.close(force: true);
+      }
+    } catch (e) {
+      return _jsonResponse({'ok': false, 'error': 'proxy_failed'}, status: 502);
     }
   }
   if (request.url.path == 'health') {
