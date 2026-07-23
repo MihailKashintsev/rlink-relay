@@ -77,6 +77,7 @@ class _User {
   final String publicKey;
   String nick;
   String x25519Key;
+  bool away = false; // true = backgrounded (don't show as online to others)
   String get shortId =>
       publicKey.length > 8 ? publicKey.substring(0, 8) : publicKey;
   DateTime connectedAt = DateTime.now();
@@ -1951,6 +1952,17 @@ void _handleMessage(_User user, dynamic raw) {
     case 'relay_ack':
       _handleRelayAck(user, msg);
       break;
+    case 'presence':
+      // Client signals away (backgrounded) or back (resumed).
+      // We broadcast online=false/true so peers see correct status without
+      // waiting for the WebSocket to actually close (which may not happen while
+      // a foreground service keeps the socket alive on Android).
+      final reqAway = msg['away'] as bool? ?? false;
+      if (user.away != reqAway) {
+        user.away = reqAway;
+        _broadcastPresence(user.publicKey, !reqAway);
+      }
+      break;
   }
 }
 
@@ -2363,7 +2375,7 @@ void _handleSearch(_User requester, Map<String, dynamic> msg) {
         'publicKey': user.publicKey,
         'nick': user.nick,
         'shortId': user.shortId,
-        'online': true,
+        'online': !user.away,
         if (user.x25519Key.isNotEmpty) 'x25519': user.x25519Key,
       });
       seenKeys.add(user.publicKey);
@@ -2458,9 +2470,10 @@ shelf.Handler _wsHandler() {
             _sendChannelDirSnapshot(ws);
             _sendBotDirSnapshot(ws);
             _sendMailboxSnapshot(user!);
-            // Send currently online peers to the new user
+            // Send currently online (non-away) peers to the new user
             for (final other in _users.values) {
               if (other.publicKey == publicKey) continue;
+              if (other.away) continue; // don't show backgrounded peers as online
               try {
                 ws.sink.add(jsonEncode({
                   'type': 'presence',
