@@ -13,6 +13,7 @@ import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'oauth.dart';
+import 'premium.dart';
 
 /// ═══════════════════════════════════════════════════════════════════
 /// Rlink Relay Server — Zero-Knowledge WebSocket Relay
@@ -1561,6 +1562,56 @@ void _handleAdminChannelVerify(_User user, Map<String, dynamic> msg) {
   ack({'ok': true, 'channelId': channelId, 'verified': verified});
 }
 
+/// Relay-admin hands out (or revokes) Premium by user id, no payment involved.
+/// Granting stacks days onto whatever time is left, so topping someone up
+/// early never shortens their subscription.
+void _handleAdminPremium(_User user, Map<String, dynamic> msg) {
+  final reqId = _jsonString(msg['reqId']);
+  void ack(Map<String, dynamic> extra) {
+    try {
+      user.ws.sink.add(jsonEncode({
+        'type': 'admin_premium_ack',
+        if (reqId.isNotEmpty) 'reqId': reqId,
+        ...extra,
+      }));
+    } catch (_) {}
+  }
+
+  if (!_isAdminHashValid(_jsonString(msg['adminHash']))) {
+    ack({'ok': false, 'error': 'forbidden'});
+    return;
+  }
+
+  final action = _jsonString(msg['action']);
+  if (action == 'list') {
+    ack({'ok': true, 'subs': premiumAll()});
+    return;
+  }
+
+  final userId = _jsonString(msg['userId']).trim().toLowerCase();
+  if (action == 'revoke') {
+    if (!adminRevokePremium(userId)) {
+      ack({'ok': false, 'error': 'bad_user_id'});
+      return;
+    }
+    stdout.writeln('[RLINK][Relay] admin_premium revoke $userId');
+    ack({'ok': true, 'userId': userId, 'untilMs': 0});
+    return;
+  }
+  if (action == 'grant') {
+    final days = (msg['days'] as num?)?.toInt() ?? 0;
+    final until = adminGrantPremium(userId, days);
+    if (until < 0) {
+      ack({'ok': false, 'error': 'bad_user_id_or_days'});
+      return;
+    }
+    stdout.writeln('[RLINK][Relay] admin_premium grant $userId +${days}d');
+    ack({'ok': true, 'userId': userId, 'untilMs': until});
+    return;
+  }
+  ack({'ok': false, 'error': 'bad_action'});
+}
+
 Future<void> _handleChannelDirPutAsync(
   _User user,
   Map<String, dynamic> msg,
@@ -1867,10 +1918,21 @@ Future<void> _notifyRecipientQueued({
         req.headers.set('Content-Type', 'application/json');
         req.add(payload);
         final resp = await req.close();
-        if (resp.statusCode == 404 || resp.statusCode == 410) {
+        // 403 = the subscription's VAPID key no longer matches ours; like
+        // 404/410 it can never succeed, so drop it and let the client
+        // re-subscribe fresh on its next sync.
+        if (resp.statusCode == 403 ||
+            resp.statusCode == 404 ||
+            resp.statusCode == 410) {
           toRemoveEndpoints.add(endpoint);
         }
-      } catch (_) {}
+        stdout.writeln('[RLINK][Push] ${resp.statusCode} '
+            '${Uri.parse(endpoint).host} → '
+            '${recipientKey.substring(0, recipientKey.length.clamp(0, 8))}');
+      } catch (e) {
+        stdout.writeln('[RLINK][Push] send error '
+            '${Uri.parse(endpoint).host}: $e');
+      }
     }
   } finally {
     client.close(force: true);
@@ -2077,6 +2139,9 @@ void _handleMessage(_User user, dynamic raw) {
       break;
     case 'admin_channel_verify':
       _handleAdminChannelVerify(user, msg);
+      break;
+    case 'admin_premium':
+      _handleAdminPremium(user, msg);
       break;
     case 'admin_password_update':
       _handleAdminPasswordUpdate(user, msg);
@@ -2743,6 +2808,28 @@ String? _botIdFromBearerApiToken(String authHeader) {
   return null;
 }
 
+/// Reused for streaming proxies (drive-audio): a per-request client can't be
+/// closed until its stream drains, so share one for the server's lifetime.
+final HttpClient _proxyClient = HttpClient()
+  ..connectionTimeout = const Duration(seconds: 15)
+  ..idleTimeout = const Duration(seconds: 30);
+
+/// Extract a Drive file id from a raw id or any Drive URL.
+String? _driveFileId(String raw) {
+  final v = raw.trim();
+  if (v.isEmpty) return null;
+  if (RegExp(r'^[A-Za-z0-9_-]{10,}$').hasMatch(v)) return v; // already an id
+  for (final re in [
+    RegExp(r'[?&]id=([A-Za-z0-9_-]+)'),
+    RegExp(r'/d/([A-Za-z0-9_-]+)'),
+    RegExp(r'/file/d/([A-Za-z0-9_-]+)'),
+  ]) {
+    final m = re.firstMatch(v);
+    if (m != null) return m.group(1);
+  }
+  return null;
+}
+
 Future<shelf.Response> _infoHandler(shelf.Request request) async {
   if (request.method == 'OPTIONS') {
     return shelf.Response(
@@ -2758,6 +2845,55 @@ Future<shelf.Response> _infoHandler(shelf.Request request) async {
   // Durable Google Drive linking: /oauth/google/{start,callback,token}.
   final oauthResp = await handleGoogleOauth(request);
   if (oauthResp != null) return oauthResp;
+  // Premium subscriptions: /premium/{create,check,webhook,status}.
+  final premiumResp = await handlePremium(request);
+  if (premiumResp != null) return premiumResp;
+  // Stream a public Google Drive audio file with range + CORS so the browser's
+  // <audio> element can play it. Drive's own download endpoint redirects and
+  // omits CORS, so a profile/uploaded track sticks at 0s on web.
+  if (request.url.path == 'drive-audio') {
+    final id = _driveFileId(request.url.queryParameters['id'] ??
+        request.url.queryParameters['u'] ??
+        '');
+    if (id == null) {
+      return _jsonResponse({'ok': false, 'error': 'bad_id'}, status: 400);
+    }
+    final upstream = Uri.parse(
+        'https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t');
+    try {
+      final req = await _proxyClient.getUrl(upstream);
+      final range = request.headers['range'];
+      if (range != null) req.headers.set('range', range);
+      req.headers.set('user-agent', 'Mozilla/5.0 (compatible; RlinkRelay)');
+      final resp = await req.close();
+      if (resp.statusCode >= 400) {
+        await resp.drain<void>();
+        return _jsonResponse(
+            {'ok': false, 'error': 'upstream_${resp.statusCode}'},
+            status: 502);
+      }
+      var ct = resp.headers.contentType?.mimeType ?? '';
+      if (ct.isEmpty || ct == 'application/octet-stream' ||
+          ct.startsWith('text/')) {
+        ct = 'audio/mpeg';
+      }
+      final headers = <String, String>{
+        'content-type': ct,
+        'accept-ranges': 'bytes',
+        'access-control-allow-origin': '*',
+        'cache-control': 'public, max-age=3600',
+      };
+      final cr = resp.headers.value('content-range');
+      if (cr != null) headers['content-range'] = cr;
+      if (resp.contentLength >= 0) {
+        headers['content-length'] = '${resp.contentLength}';
+      }
+      return shelf.Response(resp.statusCode, body: resp, headers: headers);
+    } catch (e) {
+      return _jsonResponse(
+          {'ok': false, 'error': 'proxy_failed', 'detail': '$e'}, status: 502);
+    }
+  }
   if (request.url.path == 'push/public_key') {
     if (!_webPushConfigured) {
       return _jsonResponse({'enabled': false, 'publicKey': ''}, status: 503);
@@ -2843,11 +2979,15 @@ Future<shelf.Response> _infoHandler(shelf.Request request) async {
             req.headers.set('Authorization', _vapidAuthHeader(endpoint));
             req.headers.set('Urgency', 'high');
             final resp = await req.close();
-            if (resp.statusCode == 404 || resp.statusCode == 410) {
+            if (resp.statusCode == 403 ||
+                resp.statusCode == 404 ||
+                resp.statusCode == 410) {
               toRemove.add(endpoint);
             } else if (resp.statusCode >= 200 && resp.statusCode < 300) {
               sent++;
             }
+            stdout.writeln(
+                '[RLINK][Push][test] ${resp.statusCode} ${Uri.parse(endpoint).host}');
           } catch (_) {}
         }
       } finally {
