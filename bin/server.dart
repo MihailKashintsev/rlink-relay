@@ -109,6 +109,11 @@ const _rateMax =
 /// аккаунта — клиент шифрует, relay не читает содержимое).
 final Map<String, String> _accountBlobs = {};
 
+/// publicKey -> set of publicKeys THEY have blocked. Plaintext (unlike
+/// _accountBlobs) — the relay needs to read it itself to filter presence
+/// fanout, it isn't a value passed through to another client.
+final Map<String, Set<String>> _blockedByUser = {};
+
 /// Offline mailbox: recipientPublicKey -> relayMsgId -> envelope.
 final Map<String, Map<String, Map<String, dynamic>>> _mailbox = {};
 const _mailboxFile = 'relay_mailbox.json';
@@ -1926,6 +1931,50 @@ void _persistAccountBlobs() {
   }
 }
 
+void _loadBlockedLists() {
+  try {
+    final f = File('blocked_lists.json');
+    if (!f.existsSync()) return;
+    final decoded = jsonDecode(f.readAsStringSync());
+    if (decoded is! Map) return;
+    decoded.forEach((k, v) {
+      if (k is String && v is List) {
+        _blockedByUser[k] = v.whereType<String>().toSet();
+      }
+    });
+    stdout.writeln(
+        '[RLINK][Relay] Loaded block lists for ${_blockedByUser.length} accounts');
+  } catch (e) {
+    stdout.writeln('[RLINK][Relay] blocked_lists load: $e');
+  }
+}
+
+void _persistBlockedLists() {
+  try {
+    final serializable = _blockedByUser
+        .map((k, v) => MapEntry(k, v.toList()));
+    File('blocked_lists.json').writeAsStringSync(jsonEncode(serializable));
+  } catch (e) {
+    stdout.writeln('[RLINK][Relay] blocked_lists save: $e');
+  }
+}
+
+/// Client tells us who it has blocked, full-replace each time (mirrors how
+/// BlockService keeps one flat local Set — simplest to keep both sides in
+/// sync). Used solely to filter this account OUT of presence broadcasts
+/// toward peers it has blocked; see _broadcastPresence.
+void _handleSetBlocked(_User user, Map<String, dynamic> msg) {
+  final raw = msg['blocked'];
+  if (raw is! List) return;
+  final blocked = raw.whereType<String>().map((s) => s.toLowerCase()).toSet();
+  if (blocked.isEmpty) {
+    _blockedByUser.remove(user.publicKey);
+  } else {
+    _blockedByUser[user.publicKey] = blocked;
+  }
+  _persistBlockedLists();
+}
+
 bool _checkRate(String publicKey) {
   final now = DateTime.now();
   final times = _rateLimits.putIfAbsent(publicKey, () => []);
@@ -1995,6 +2044,9 @@ void _handleMessage(_User user, dynamic raw) {
       break;
     case 'account_sync_put':
       _handleAccountSyncPut(user, msg);
+      break;
+    case 'set_blocked':
+      _handleSetBlocked(user, msg);
       break;
     case 'channel_dir_put':
       _handleChannelDirPut(user, msg);
@@ -2647,8 +2699,16 @@ void _broadcastPresence(String publicKey, bool online) {
     if (nick.isNotEmpty) 'nick': nick,
     if (x25519Key.isNotEmpty) 'x25519': x25519Key,
   });
+  // A contact `publicKey` has blocked never learns publicKey went on/offline
+  // in the first place — the only place this can be enforced, since once a
+  // peer's own client has received a presence update there is no way to make
+  // it un-know that.
+  final blockedBySource = _blockedByUser[publicKey];
   for (final user in _users.values) {
     if (user.publicKey == publicKey) continue;
+    if (blockedBySource != null && blockedBySource.contains(user.publicKey)) {
+      continue;
+    }
     try {
       user.ws.sink.add(msg);
     } catch (_) {}
@@ -2994,6 +3054,7 @@ Future<void> main() async {
   final port = int.tryParse(Platform.environment['PORT'] ?? '') ?? 8080;
   _loadRelayAdminConfig();
   _loadAccountBlobs();
+  _loadBlockedLists();
   _loadMailbox();
   _loadPushSubscriptions();
   _loadChannelDirectory();
