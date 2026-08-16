@@ -24,11 +24,14 @@ Do not use the development/default admin password in production. Keep
 
 ## 1) Configure TURN credentials
 
-Edit `turnserver.conf`:
-- `realm=...`
-- `user=rlink:change_me_strong_password`
+Set `TURN_USER` and `TURN_PASSWORD` in `.env` (see `.env.example`) — that's
+the only place they live. `docker-compose.yml` passes them to coturn via
+`--user=$TURN_USER:$TURN_PASSWORD` at container start; `turnserver.conf`
+itself carries no credentials since this repo is public.
 
-Use a strong password in production.
+The app must be built with the *same* TURN_USER/TURN_PASSWORD as
+`--dart-define`s (see the mobile/desktop repo's release workflow) — a
+mismatch here doesn't error, it just leaves every call with no TURN fallback.
 
 ## 2) Start services
 

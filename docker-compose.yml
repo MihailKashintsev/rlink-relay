@@ -27,7 +27,11 @@ services:
     image: coturn/coturn:4.6.3-r2
     container_name: rlink-turn
     restart: unless-stopped
-    command: ["-c", "/etc/coturn/turnserver.conf"]
+    # Credentials come from .env, not turnserver.conf (public repo — see the
+    # comment there). The relay's own TURN_USER/TURN_PASSWORD env vars above
+    # are what CallService is built with via --dart-define, so this is the
+    # single source of truth both sides read from.
+    command: ["-c", "/etc/coturn/turnserver.conf", "--user=${TURN_USER:-rlink}:${TURN_PASSWORD}"]
     ports:
       - "3478:3478/tcp"
       - "3478:3478/udp"
